@@ -2,12 +2,11 @@
   "name": "pizzahub-server",
   "version": "1.0.0",
   "description": "REST API for PizzaHub - pizza ordering and delivery platform",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
-    "dev": "nodemon src/index.js",
-    "start": "node src/index.js",
-    "make-admin": "node scripts/make-admin.js",
-    "seed:menu": "node scripts/seed-menu.js"
+    "dev": "nodemon index.js",
+    "start": "node index.js",
+    "make-admin": "node scripts/make-admin.js"
   },
   "keywords": [],
   "author": "Sheikh Sazzaduzzaman",
