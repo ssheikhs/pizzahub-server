@@ -555,6 +555,102 @@ app.patch('/vendor/orders/:id', verifyToken, verifyVendor, async (req, res) => {
     res.send(result);
 });
 
+// ---------- orders related apis ----------
+
+app.post('/orders', verifyToken, verifyCustomer, async (req, res) => {
+    const body = req.body || {};
+    if (!isValidId(body.itemId)) return res.status(400).send({ message: 'Invalid menu item id' });
+    const { data, errors } = validateOrder(body);
+    if (Object.keys(errors).length) return sendValidationError(res, errors);
+
+    const itemId = new ObjectId(body.itemId);
+    const item = await menuItems.findOne({ _id: itemId });
+    if (!item) return res.status(404).send({ message: 'Menu item not found' });
+    if (item.status !== 'approved') return res.status(409).send({ message: 'This item is not available for ordering right now' });
+    if (item.vendorId.equals(req.user._id)) return res.status(403).send({ message: 'You cannot order your own menu item' });
+
+    const duplicate = await orders.findOne({
+        itemId,
+        customerId: req.user._id,
+        deliveryDate: data.deliveryDate,
+        status: { $in: ['pending', 'accepted'] },
+    });
+    if (duplicate) {
+        return res.status(409).send({ message: 'You already have an active order for this item on that delivery date' });
+    }
+
+    const now = new Date();
+    const order = {
+        itemId,
+        vendorId: item.vendorId,
+        customerId: req.user._id,
+        ...data,
+        price: item.price,
+        status: 'pending',
+        statusHistory: [{ status: 'pending', at: now, by: 'customer' }],
+        createdAt: now,
+        updatedAt: now,
+    };
+    const result = await orders.insertOne(order);
+    res.status(201).send({ ...order, _id: result.insertedId });
+});
+
+app.get('/orders/my', verifyToken, verifyCustomer, async (req, res) => {
+    const query = { customerId: req.user._id };
+    if (ORDER_STATUSES.includes(req.query.status)) query.status = req.query.status;
+    const result = await orders.aggregate([{ $match: query }, { $sort: { createdAt: -1 } }, ...lookupItem, ...lookupVendor]).toArray();
+    res.send(result);
+});
+
+app.get('/orders/stats', verifyToken, verifyCustomer, async (req, res) => {
+    const grouped = await orders.aggregate([{ $match: { customerId: req.user._id } }, { $group: { _id: '$status', count: { $sum: 1 } } }]).toArray();
+    const spent = await orders
+        .aggregate([{ $match: { customerId: req.user._id, status: 'accepted' } }, { $group: { _id: null, total: { $sum: '$price' } } }])
+        .toArray();
+    const counts = Object.fromEntries(grouped.map((g) => [g._id, g.count]));
+    res.send({
+        total: grouped.reduce((sum, g) => sum + g.count, 0),
+        pending: counts.pending || 0,
+        accepted: counts.accepted || 0,
+        rejected: counts.rejected || 0,
+        cancelled: counts.cancelled || 0,
+        acceptedValue: spent[0]?.total || 0,
+    });
+});
+
+// the customer, the vendor of the order, or an admin
+app.get('/orders/:id', verifyToken, async (req, res) => {
+    if (!isValidId(req.params.id)) return res.status(400).send({ message: 'Invalid order id' });
+    const [order] = await orders
+        .aggregate([{ $match: { _id: new ObjectId(req.params.id) } }, ...lookupItem, ...lookupVendor, ...lookupCustomer])
+        .toArray();
+    if (!order) return res.status(404).send({ message: 'Order not found' });
+
+    const allowed = order.customerId.equals(req.user._id) || order.vendorId.equals(req.user._id) || req.user.role === 'admin';
+    if (!allowed) return res.status(403).send({ message: 'You cannot view this order' });
+    res.send(order);
+});
+
+// customers can cancel their own pending orders
+app.patch('/orders/:id/cancel', verifyToken, verifyCustomer, async (req, res) => {
+    if (!isValidId(req.params.id)) return res.status(400).send({ message: 'Invalid order id' });
+    const _id = new ObjectId(req.params.id);
+    const order = await orders.findOne({ _id });
+    if (!order) return res.status(404).send({ message: 'Order not found' });
+    if (!order.customerId.equals(req.user._id)) return res.status(403).send({ message: 'You can only cancel your own orders' });
+
+    const result = await orders.findOneAndUpdate(
+        { _id, status: 'pending' },
+        {
+            $set: { status: 'cancelled', updatedAt: new Date() },
+            $push: { statusHistory: { status: 'cancelled', at: new Date(), by: 'customer' } },
+        },
+        { returnDocument: 'after' }
+    );
+    if (!result) return res.status(409).send({ message: `Only pending orders can be cancelled. This order is ${order.status}.` });
+    res.send(result);
+});
+
 // ---------- errors ----------
 
 app.use((req, res) => {
