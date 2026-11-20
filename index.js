@@ -394,6 +394,167 @@ app.get('/menu/:id', verifyToken, async (req, res) => {
     res.send(item);
 });
 
+// ---------- vendor related apis ----------
+
+// items waiting for review and live items both use a publishing slot
+const ACTIVE_STATUSES = ['pending', 'approved'];
+
+const canPublish = async (vendor, excludeId) => {
+    if (vendor.subscriptionPlan === 'premium') return true;
+    const query = { vendorId: vendor._id, status: { $in: ACTIVE_STATUSES } };
+    if (excludeId) query._id = { $ne: excludeId };
+    const active = await menuItems.countDocuments(query);
+    return active < FREE_ITEM_LIMIT;
+};
+
+const planLimitError = {
+    message: `Free plan allows ${FREE_ITEM_LIMIT} active menu items. Upgrade to Premium to publish unlimited items.`,
+    code: 'PLAN_LIMIT',
+};
+
+// find an item and make sure it belongs to the logged in vendor
+const findOwnItem = async (req, res) => {
+    if (!isValidId(req.params.id)) {
+        res.status(400).send({ message: 'Invalid menu item id' });
+        return null;
+    }
+    const item = await menuItems.findOne({ _id: new ObjectId(req.params.id) });
+    if (!item) {
+        res.status(404).send({ message: 'Menu item not found' });
+        return null;
+    }
+    if (!item.vendorId.equals(req.user._id)) {
+        res.status(403).send({ message: 'You can only manage your own menu items' });
+        return null;
+    }
+    return item;
+};
+
+app.get('/vendor/stats', verifyToken, verifyVendor, async (req, res) => {
+    const vendorId = req.user._id;
+    const itemStatus = await menuItems.aggregate([{ $match: { vendorId } }, { $group: { _id: '$status', count: { $sum: 1 } } }]).toArray();
+    const orderStatus = await orders.aggregate([{ $match: { vendorId } }, { $group: { _id: '$status', count: { $sum: 1 } } }]).toArray();
+    const ordersByDay = await orders
+        .aggregate([
+            { $match: { vendorId, createdAt: { $gte: new Date(Date.now() - 13 * 864e5) } } },
+            { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+            { $sort: { _id: 1 } },
+        ])
+        .toArray();
+
+    const items = Object.fromEntries(itemStatus.map((s) => [s._id, s.count]));
+    const ords = Object.fromEntries(orderStatus.map((s) => [s._id, s.count]));
+    res.send({
+        totalItems: itemStatus.reduce((sum, s) => sum + s.count, 0),
+        activeItems: items.approved || 0,
+        pendingItems: items.pending || 0,
+        pendingOrders: ords.pending || 0,
+        acceptedOrders: ords.accepted || 0,
+        rejectedOrders: ords.rejected || 0,
+        cancelledOrders: ords.cancelled || 0,
+        subscriptionPlan: req.user.subscriptionPlan || 'free',
+        subscriptionExpiresAt: req.user.subscriptionExpiresAt || null,
+        ordersByDay,
+    });
+});
+
+app.get('/vendor/menu', verifyToken, verifyVendor, async (req, res) => {
+    const result = await menuItems.find({ vendorId: req.user._id }).sort({ createdAt: -1 }).toArray();
+    res.send(result);
+});
+
+// new items always start as pending
+app.post('/vendor/menu', verifyToken, verifyVendor, async (req, res) => {
+    const { data, errors } = validateMenuItem(req.body || {});
+    if (Object.keys(errors).length) return sendValidationError(res, errors);
+    if (!(await canPublish(req.user))) return res.status(403).send(planLimitError);
+
+    const item = { ...data, vendorId: req.user._id, status: 'pending', createdAt: new Date(), updatedAt: new Date() };
+    const result = await menuItems.insertOne(item);
+    res.status(201).send({ ...item, _id: result.insertedId });
+});
+
+// edits go back to admin review (paused items stay paused)
+app.patch('/vendor/menu/:id', verifyToken, verifyVendor, async (req, res) => {
+    const item = await findOwnItem(req, res);
+    if (!item) return;
+
+    const { data, errors } = validateMenuItem(req.body || {}, true);
+    if (Object.keys(errors).length) return sendValidationError(res, errors);
+    if (!Object.keys(data).length) return res.status(400).send({ message: 'Nothing to update' });
+
+    const nextStatus = item.status === 'inactive' ? 'inactive' : 'pending';
+    if (nextStatus === 'pending' && !ACTIVE_STATUSES.includes(item.status) && !(await canPublish(req.user, item._id))) {
+        return res.status(403).send(planLimitError);
+    }
+
+    const result = await menuItems.findOneAndUpdate(
+        { _id: item._id },
+        { $set: { ...data, status: nextStatus, updatedAt: new Date() } },
+        { returnDocument: 'after' }
+    );
+    res.send(result);
+});
+
+// pause an item, or send a paused item back for review
+app.patch('/vendor/menu/:id/availability', verifyToken, verifyVendor, async (req, res) => {
+    const item = await findOwnItem(req, res);
+    if (!item) return;
+
+    if (req.body?.available !== true) {
+        if (!ACTIVE_STATUSES.includes(item.status)) return res.status(409).send({ message: 'Only live or pending items can be paused' });
+        await menuItems.updateOne({ _id: item._id }, { $set: { status: 'inactive', updatedAt: new Date() } });
+        return res.send({ status: 'inactive' });
+    }
+
+    if (item.status !== 'inactive') return res.status(409).send({ message: 'Only paused items can be made available again' });
+    if (!(await canPublish(req.user, item._id))) return res.status(403).send(planLimitError);
+    await menuItems.updateOne({ _id: item._id }, { $set: { status: 'pending', updatedAt: new Date() } });
+    res.send({ status: 'pending' });
+});
+
+app.delete('/vendor/menu/:id', verifyToken, verifyVendor, async (req, res) => {
+    const item = await findOwnItem(req, res);
+    if (!item) return;
+
+    const openOrders = await orders.countDocuments({ itemId: item._id, status: { $in: ['pending', 'accepted'] } });
+    if (openOrders > 0) {
+        return res.status(409).send({ message: 'This item has open orders. Pause it instead, or resolve the orders first.' });
+    }
+    const result = await menuItems.deleteOne({ _id: item._id });
+    res.send(result);
+});
+
+app.get('/vendor/orders', verifyToken, verifyVendor, async (req, res) => {
+    const query = { vendorId: req.user._id };
+    if (ORDER_STATUSES.includes(req.query.status)) query.status = req.query.status;
+    const result = await orders.aggregate([{ $match: query }, { $sort: { createdAt: -1 } }, ...lookupItem, ...lookupCustomer]).toArray();
+    res.send(result);
+});
+
+// accept or reject a pending order (only once)
+app.patch('/vendor/orders/:id', verifyToken, verifyVendor, async (req, res) => {
+    if (!isValidId(req.params.id)) return res.status(400).send({ message: 'Invalid order id' });
+    const status = req.body?.status;
+    if (!['accepted', 'rejected'].includes(status)) return res.status(400).send({ message: 'Status must be accepted or rejected' });
+
+    const _id = new ObjectId(req.params.id);
+    const order = await orders.findOne({ _id });
+    if (!order) return res.status(404).send({ message: 'Order not found' });
+    if (!order.vendorId.equals(req.user._id)) return res.status(403).send({ message: 'This order belongs to another restaurant' });
+
+    const result = await orders.findOneAndUpdate(
+        { _id, status: 'pending' },
+        {
+            $set: { status, updatedAt: new Date() },
+            $push: { statusHistory: { status, at: new Date(), by: 'vendor' } },
+        },
+        { returnDocument: 'after' }
+    );
+    if (!result) return res.status(409).send({ message: `This order is already ${order.status}` });
+    res.send(result);
+});
+
 // ---------- errors ----------
 
 app.use((req, res) => {
