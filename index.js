@@ -651,6 +651,174 @@ app.patch('/orders/:id/cancel', verifyToken, verifyCustomer, async (req, res) =>
     res.send(result);
 });
 
+// ---------- admin related apis ----------
+
+app.get('/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
+    const roles = await users.aggregate([{ $group: { _id: '$role', count: { $sum: 1 } } }]).toArray();
+    const itemStatus = await menuItems.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]).toArray();
+    const itemCategory = await menuItems.aggregate([{ $group: { _id: '$category', count: { $sum: 1 } } }]).toArray();
+    const totalTransactions = await transactions.countDocuments();
+    const revenueByMonth = await transactions
+        .aggregate([
+            { $match: { status: 'paid' } },
+            { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$createdAt' } }, amount: { $sum: '$amount' } } },
+            { $sort: { _id: 1 } },
+            { $limit: 12 },
+        ])
+        .toArray();
+
+    const roleCount = Object.fromEntries(roles.map((r) => [r._id, r.count]));
+    const statusCount = Object.fromEntries(itemStatus.map((s) => [s._id, s.count]));
+    const categoryCount = Object.fromEntries(itemCategory.map((c) => [c._id, c.count]));
+    res.send({
+        totalUsers: roles.reduce((sum, r) => sum + r.count, 0),
+        totalVendors: roleCount.vendor || 0,
+        totalCustomers: roleCount.customer || 0,
+        totalMenuItems: itemStatus.reduce((sum, s) => sum + s.count, 0),
+        pendingMenuItems: statusCount.pending || 0,
+        totalTransactions,
+        itemStatus: statusCount,
+        itemsByCategory: CATEGORIES.map((name) => ({ name, count: categoryCount[name] || 0 })),
+        revenueByMonth,
+    });
+});
+
+app.get('/admin/users', verifyToken, verifyAdmin, async (req, res) => {
+    const { search, role } = req.query;
+    const { page, limit, skip } = getPaging(req.query, 10);
+    const query = {};
+    if (search?.trim()) {
+        const regex = new RegExp(escapeRegex(search.trim()), 'i');
+        query.$or = [{ name: regex }, { email: regex }];
+    }
+    if (['admin', 'vendor', 'customer'].includes(role)) query.role = role;
+
+    const result = await users
+        .find(query, {
+            projection: {
+                name: 1, email: 1, image: 1, role: 1, isBlocked: 1, businessName: 1,
+                subscriptionPlan: 1, subscriptionExpiresAt: 1, phone: 1, address: 1, createdAt: 1,
+            },
+        })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray();
+    const total = await users.countDocuments(query);
+    res.send({ users: result, total, page, limit, totalPages: Math.max(1, Math.ceil(total / limit)) });
+});
+
+// block or unblock a user (blocked users are signed out everywhere)
+app.patch('/admin/users/:id/block', verifyToken, verifyAdmin, async (req, res) => {
+    if (!isValidId(req.params.id)) return res.status(400).send({ message: 'Invalid user id' });
+    const _id = new ObjectId(req.params.id);
+    if (_id.equals(req.user._id)) return res.status(400).send({ message: 'You cannot block your own account' });
+
+    const user = await users.findOne({ _id });
+    if (!user) return res.status(404).send({ message: 'User not found' });
+    if (user.role === 'admin') return res.status(403).send({ message: 'Admin accounts cannot be blocked' });
+
+    const blocked = req.body?.blocked === true;
+    const result = await users.updateOne({ _id }, { $set: { isBlocked: blocked, updatedAt: new Date() } });
+    if (blocked) {
+        await sessions.deleteMany({ userId: { $in: [_id, req.params.id] } });
+    }
+    res.send(result);
+});
+
+app.get('/admin/menu', verifyToken, verifyAdmin, async (req, res) => {
+    const { search, status, category } = req.query;
+    const { page, limit, skip } = getPaging(req.query, 10);
+    const query = {};
+    if (search?.trim()) {
+        const regex = new RegExp(escapeRegex(search.trim()), 'i');
+        query.$or = [{ itemName: regex }, { location: regex }];
+    }
+    if (MENU_STATUSES.includes(status)) query.status = status;
+    if (CATEGORIES.includes(category)) query.category = category;
+
+    const [result] = await menuItems
+        .aggregate([
+            { $match: query },
+            {
+                $facet: {
+                    items: [{ $sort: { createdAt: -1 } }, { $skip: skip }, { $limit: limit }, ...lookupVendor],
+                    total: [{ $count: 'count' }],
+                },
+            },
+        ])
+        .toArray();
+    const total = result.total[0]?.count || 0;
+    res.send({ items: result.items, total, page, limit, totalPages: Math.max(1, Math.ceil(total / limit)) });
+});
+
+app.patch('/admin/menu/:id/status', verifyToken, verifyAdmin, async (req, res) => {
+    if (!isValidId(req.params.id)) return res.status(400).send({ message: 'Invalid menu item id' });
+    const status = req.body?.status;
+    if (!MENU_STATUSES.includes(status)) return res.status(400).send({ message: 'Invalid status' });
+
+    const result = await menuItems.findOneAndUpdate(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { status, reviewedAt: new Date(), updatedAt: new Date() } },
+        { returnDocument: 'after' }
+    );
+    if (!result) return res.status(404).send({ message: 'Menu item not found' });
+    res.send(result);
+});
+
+// remove inappropriate items; pending orders for them are rejected
+app.delete('/admin/menu/:id', verifyToken, verifyAdmin, async (req, res) => {
+    if (!isValidId(req.params.id)) return res.status(400).send({ message: 'Invalid menu item id' });
+    const _id = new ObjectId(req.params.id);
+    const result = await menuItems.deleteOne({ _id });
+    if (!result.deletedCount) return res.status(404).send({ message: 'Menu item not found' });
+
+    await orders.updateMany(
+        { itemId: _id, status: 'pending' },
+        {
+            $set: { status: 'rejected', updatedAt: new Date() },
+            $push: { statusHistory: { status: 'rejected', at: new Date(), by: 'admin', note: 'Item removed' } },
+        }
+    );
+    res.send(result);
+});
+
+// read-only: there are no routes to edit or delete payment records
+app.get('/admin/transactions', verifyToken, verifyAdmin, async (req, res) => {
+    const { page, limit, skip } = getPaging(req.query, 10);
+    const query = {};
+    if (['pending', 'paid', 'failed', 'expired'].includes(req.query.status)) query.status = req.query.status;
+
+    const result = await transactions
+        .aggregate([
+            { $match: query },
+            { $sort: { createdAt: -1 } },
+            { $skip: skip },
+            { $limit: limit },
+            {
+                $lookup: {
+                    from: 'users',
+                    localField: 'vendorId',
+                    foreignField: '_id',
+                    as: 'vendor',
+                    pipeline: [{ $project: { name: 1, email: 1, image: 1, businessName: 1 } }],
+                },
+            },
+            { $unwind: { path: '$vendor', preserveNullAndEmptyArrays: true } },
+        ])
+        .toArray();
+    const total = await transactions.countDocuments(query);
+    const revenue = await transactions.aggregate([{ $match: { status: 'paid' } }, { $group: { _id: null, sum: { $sum: '$amount' } } }]).toArray();
+    res.send({
+        transactions: result,
+        total,
+        revenue: revenue[0]?.sum || 0,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+});
+
 // ---------- errors ----------
 
 app.use((req, res) => {
