@@ -27,6 +27,10 @@ const ORDER_STATUSES = ['pending', 'accepted', 'rejected', 'cancelled'];
 // middleware
 app.use(cors({ origin: [clientUrl, 'http://localhost:3000'], credentials: true }));
 
+// Stripe needs the raw body to check the signature, so the webhook is
+// registered before express.json(). The handler is defined at the bottom.
+app.post('/payments/webhook', express.raw({ type: 'application/json' }), (req, res) => stripeWebhook(req, res));
+
 app.use(express.json({ limit: '1mb' }));
 
 const client = new MongoClient(process.env.MONGODB_URI);
@@ -818,6 +822,170 @@ app.get('/admin/transactions', verifyToken, verifyAdmin, async (req, res) => {
         totalPages: Math.max(1, Math.ceil(total / limit)),
     });
 });
+
+// ---------- payments related apis ----------
+
+// current_period_end lives on the subscription item in newer Stripe API versions
+const getPeriodEnd = (subscription) => {
+    const end = subscription?.items?.data?.[0]?.current_period_end ?? subscription?.current_period_end;
+    return end ? new Date(end * 1000) : new Date(Date.now() + 30 * 864e5);
+};
+
+// the vendor comes from the verified token, so nobody can pay for another vendor
+app.post('/payments/checkout', verifyToken, verifyVendor, async (req, res) => {
+    const vendor = req.user;
+    if (vendor.subscriptionPlan === 'premium') return res.status(409).send({ message: 'You are already on the Premium plan' });
+
+    const session = await stripe.checkout.sessions.create({
+        mode: 'subscription',
+        customer_email: vendor.email,
+        client_reference_id: vendor._id.toString(),
+        line_items: [
+            {
+                quantity: 1,
+                price_data: {
+                    currency: 'usd',
+                    unit_amount: Math.round(PREMIUM_PRICE * 100),
+                    recurring: { interval: 'month' },
+                    product_data: {
+                        name: 'PizzaHub Premium',
+                        description: 'Unlimited active menu items, Premium badge and featured placement',
+                    },
+                },
+            },
+        ],
+        metadata: { vendorId: vendor._id.toString(), plan: 'premium' },
+        subscription_data: { metadata: { vendorId: vendor._id.toString(), plan: 'premium' } },
+        success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${clientUrl}/payment/cancel`,
+    });
+
+    await transactions.insertOne({
+        vendorId: vendor._id,
+        plan: 'premium',
+        amount: PREMIUM_PRICE,
+        currency: 'usd',
+        stripeSessionId: session.id,
+        stripeSubscriptionId: null,
+        status: 'pending',
+        createdAt: new Date(),
+    });
+    res.send({ url: session.url });
+});
+
+// read-only status for the success page (premium is switched on by the webhook)
+app.get('/payments/session/:sessionId', verifyToken, verifyVendor, async (req, res) => {
+    const transaction = await transactions.findOne({ stripeSessionId: String(req.params.sessionId) });
+    if (!transaction) return res.status(404).send({ message: 'Payment session not found' });
+    if (!transaction.vendorId.equals(req.user._id)) return res.status(403).send({ message: 'This payment belongs to another vendor' });
+    res.send({
+        status: transaction.status,
+        amount: transaction.amount,
+        currency: transaction.currency,
+        plan: transaction.plan,
+        subscriptionPlan: req.user.subscriptionPlan || 'free',
+        subscriptionExpiresAt: req.user.subscriptionExpiresAt || null,
+    });
+});
+
+app.get('/payments/my', verifyToken, verifyVendor, async (req, res) => {
+    const result = await transactions
+        .find({ vendorId: req.user._id }, { projection: { stripeSubscriptionId: 0 } })
+        .sort({ createdAt: -1 })
+        .limit(20)
+        .toArray();
+    res.send(result);
+});
+
+// cancel at the end of the paid period
+app.post('/payments/cancel', verifyToken, verifyVendor, async (req, res) => {
+    if (req.user.subscriptionPlan !== 'premium') return res.status(409).send({ message: 'You do not have an active Premium plan' });
+    const transaction = await transactions.findOne(
+        { vendorId: req.user._id, status: 'paid', stripeSubscriptionId: { $ne: null } },
+        { sort: { createdAt: -1 } }
+    );
+    if (!transaction) return res.status(404).send({ message: 'No active subscription was found' });
+
+    const subscription = await stripe.subscriptions.update(transaction.stripeSubscriptionId, { cancel_at_period_end: true });
+    const expiresAt = getPeriodEnd(subscription);
+    await users.updateOne({ _id: req.user._id }, { $set: { subscriptionCancelAtPeriodEnd: true, subscriptionExpiresAt: expiresAt } });
+    res.send({ cancelAtPeriodEnd: true, subscriptionExpiresAt: expiresAt });
+});
+
+// Stripe webhook: the only place where premium is activated
+async function stripeWebhook(req, res) {
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        console.log('Webhook signature verification failed:', err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+        const object = event.data.object;
+
+        if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+            if (object.payment_status === 'paid') {
+                // only a pending transaction can be marked paid, so a retried event does nothing
+                const transaction = await transactions.findOneAndUpdate(
+                    { stripeSessionId: object.id, status: { $ne: 'paid' } },
+                    {
+                        $set: {
+                            status: 'paid',
+                            stripeSubscriptionId: object.subscription || null,
+                            amount: object.amount_total / 100,
+                            paidAt: new Date(),
+                        },
+                    }
+                );
+                if (transaction) {
+                    const subscription = object.subscription ? await stripe.subscriptions.retrieve(object.subscription) : null;
+                    await users.updateOne(
+                        { _id: transaction.vendorId },
+                        { $set: { subscriptionPlan: 'premium', subscriptionExpiresAt: getPeriodEnd(subscription), subscriptionCancelAtPeriodEnd: false } }
+                    );
+                }
+            }
+        }
+
+        if (event.type === 'checkout.session.async_payment_failed' || event.type === 'checkout.session.expired') {
+            await transactions.updateOne(
+                { stripeSessionId: object.id, status: 'pending' },
+                { $set: { status: event.type.endsWith('expired') ? 'expired' : 'failed' } }
+            );
+        }
+
+        // renewals extend the paid period
+        if (event.type === 'invoice.paid' && object.billing_reason !== 'subscription_create') {
+            const subscriptionId = object.subscription || object.parent?.subscription_details?.subscription;
+            const transaction = subscriptionId ? await transactions.findOne({ stripeSubscriptionId: subscriptionId }) : null;
+            if (transaction) {
+                const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+                await users.updateOne(
+                    { _id: transaction.vendorId },
+                    { $set: { subscriptionPlan: 'premium', subscriptionExpiresAt: getPeriodEnd(subscription) } }
+                );
+            }
+        }
+
+        if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+            const transaction = await transactions.findOne({ stripeSubscriptionId: object.id });
+            if (transaction) {
+                const update =
+                    event.type === 'customer.subscription.deleted'
+                        ? { subscriptionPlan: 'free', subscriptionExpiresAt: null, subscriptionCancelAtPeriodEnd: false }
+                        : { subscriptionCancelAtPeriodEnd: !!object.cancel_at_period_end, subscriptionExpiresAt: getPeriodEnd(object) };
+                await users.updateOne({ _id: transaction.vendorId }, { $set: update });
+            }
+        }
+
+        res.send({ received: true });
+    } catch (err) {
+        console.log('Webhook handling failed:', err);
+        res.status(500).send({ message: 'Webhook handling failed' });
+    }
+}
 
 // ---------- errors ----------
 
