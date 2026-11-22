@@ -2,8 +2,8 @@
 
 The REST API for **PizzaHub**, a pizza ordering and delivery platform with Customer, Vendor and Admin roles. It's built with Express and MongoDB, verifies JWTs issued by Better Auth (running in the Next.js client), and handles Stripe subscription payments through webhooks.
 
-- **Live API:** _add your Vercel server URL here_
-- **Live site:** _add your Vercel client URL here_
+- **Live API:** https://pizzahub-server-umber.vercel.app
+- **Live site:** https://pizzahub-client-coral.vercel.app
 - **Client repository:** https://github.com/ssheikhs/pizzahub-client
 - **Server repository:** https://github.com/ssheikhs/pizzahub-server
 
